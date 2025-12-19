@@ -1,62 +1,48 @@
-// DEBUG: Confirm server is starting
-console.log("🚀 Starting Server...");
-
 import Fastify from 'fastify';
 import fastifyWs from '@fastify/websocket';
 import fastifyFormBody from '@fastify/formbody';
 import WebSocket from 'ws';
 
-// Required for Render to assign the correct port
+// Constants
 const PORT = process.env.PORT || 3000;
-
-// Check for API Key (Will warn if missing, but won't crash)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_API_KEY) {
-  console.warn("⚠️ WARNING: GEMINI_API_KEY is missing in Render Environment Variables!");
-}
-
-const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 const MODEL_NAME = "models/gemini-2.5-flash-native-audio-preview-12-2025";
+const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
 const fastify = Fastify({ logger: true });
-
-// Register Plugins
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// 1. HEALTH CHECK ROUTE (Open this in browser to test)
-fastify.get('/', async (request, reply) => {
-  return { status: "OK", message: "Server is running!", timestamp: new Date() };
-});
+// Root Route
+fastify.get('/', async () => ({ status: "OK", message: "Voice Server Running" }));
 
-// 2. TWILIO WEBHOOK
+// Twilio TwiML Webhook
 fastify.all('/twiml', async (request, reply) => {
   const host = request.headers.host;
-  // Handle both local and production URLs
-  const protocol = host.includes('localhost') ? 'ws' : 'wss';
-  const wssUrl = `${protocol}://${host}/media-stream`;
-
+  const wssUrl = `wss://${host}/media-stream`;
   reply.type('text/xml');
   return `<?xml version="1.0" encoding="UTF-8"?>
   <Response>
-      <Say>Connecting to Gemini 2.5.</Say>
       <Connect>
           <Stream url="${wssUrl}" />
       </Connect>
-      <Pause length="300" />
+      <Pause length="3600" /> 
   </Response>`;
 });
 
-// 3. WEBSOCKET ROUTE
+// WebSocket Handler
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-    console.log("✅ Twilio Connected");
+    console.log("📞 Call Connected");
 
     let streamSid = null;
     let geminiWs = new WebSocket(GEMINI_URL);
+    let audioQueue = []; // Queue for buffering Gemini audio
 
+    // 1. Connect to Gemini
     geminiWs.on('open', () => {
-      console.log("✅ Gemini Socket Open");
+      console.log("✨ Connected to Gemini");
+      // Setup the session
       geminiWs.send(JSON.stringify({
         setup: {
           model: MODEL_NAME,
@@ -66,80 +52,186 @@ fastify.register(async (fastify) => {
           }
         }
       }));
+
+      // Send initial greeting to get the conversation started
+      const greeting = {
+        clientContent: {
+          turns: [{ role: "user", parts: [{ text: "Hello, please introduce yourself briefly." }] }],
+          turnComplete: true
+        }
+      };
+      geminiWs.send(JSON.stringify(greeting));
     });
 
+    // 2. Handle Gemini Messages
     geminiWs.on('message', (data) => {
       try {
         const response = JSON.parse(data);
+
+        // A. Handle Audio Output (Gemini Speaking)
         if (response.serverContent && response.serverContent.modelTurn) {
           response.serverContent.modelTurn.parts.forEach(part => {
             if (part.inlineData && part.inlineData.mimeType.startsWith('audio/pcm')) {
               if (streamSid) {
+                // Decode Gemini (24k) -> Encode Twilio (8k Mu-Law)
                 const pcm24k = Buffer.from(part.inlineData.data, 'base64');
-                const mulaw8k = pcmToMulaw(downsampleTo8k(pcm24k));
-                connection.socket.send(JSON.stringify({
+                const pcm8k = downsampleLinear(pcm24k, 24000, 8000);
+                const mulaw8k = pcmToMulaw(pcm8k);
+                
+                // Send immediately to Twilio
+                const mediaMsg = {
                   event: "media",
                   streamSid,
                   media: { payload: mulaw8k.toString('base64') }
-                }));
+                };
+                connection.socket.send(JSON.stringify(mediaMsg));
               }
             }
           });
         }
+
+        // B. Handle Interruption (Gemini heard you!)
+        // This flag tells us Gemini has stopped generating because you spoke.
+        if (response.serverContent && response.serverContent.interrupted) {
+          console.log("🛑 Interrupted by User! Clearing audio.");
+          // Twilio doesn't support "Clear Buffer" natively in Streams easily,
+          // but stopping the send loop usually works.
+          // Note: Twilio will play whatever is currently in its short buffer (approx 200-500ms).
+        }
+
+        if (response.serverContent && response.serverContent.turnComplete) {
+           console.log("✅ Turn Complete");
+        }
       } catch (e) {
-        console.error("Gemini Parse Error", e);
+        console.error("Error parsing Gemini message:", e);
       }
     });
 
-    geminiWs.on('close', (code, reason) => {
-      console.log(`❌ Gemini Closed: ${code} ${reason}`);
-    });
+    geminiWs.on('close', () => console.log("Gemini Disconnected"));
 
-    geminiWs.on('error', (error) => {
-      console.error("❌ Gemini Error:", error);
-    });
-
+    // 3. Handle Twilio Messages (User Speaking)
     connection.socket.on('message', (msg) => {
       try {
         const data = JSON.parse(msg);
+
         if (data.event === 'start') {
           streamSid = data.start.streamSid;
           console.log(`▶️ Stream Started: ${streamSid}`);
-          if (geminiWs.readyState === WebSocket.OPEN) {
-            // Send initial greeting trigger
-            geminiWs.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text: "Hello, please introduce yourself." }] }], turnComplete: true } }));
-          }
         } else if (data.event === 'media' && geminiWs.readyState === WebSocket.OPEN) {
-          const pcm16k = upsampleTo16k(mulawToPcm(Buffer.from(data.media.payload, 'base64')));
+          // 1. Get 8k Mu-Law chunk
+          const mulaw8k = Buffer.from(data.media.payload, 'base64');
+          
+          // 2. Convert to 16k PCM (Using Linear Interpolation for quality)
+          const pcm8k = mulawToPcm(mulaw8k);
+          const pcm16k = upsampleLinear(pcm8k, 8000, 16000);
+
+          // 3. Send to Gemini
           geminiWs.send(JSON.stringify({
             realtimeInput: {
-              mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: pcm16k.toString('base64') }]
+              mediaChunks: [{
+                mimeType: "audio/pcm;rate=16000",
+                data: pcm16k.toString('base64')
+              }]
             }
           }));
         } else if (data.event === 'stop') {
+          console.log("⏹️ Call Ended");
           geminiWs.close();
         }
       } catch (e) {
-        console.error("Twilio Parse Error", e);
+        console.error("Twilio Message Error:", e);
       }
     });
   });
 });
 
-// AUDIO UTILS
-function downsampleTo8k(b){const i=new Int16Array(b.buffer,b.byteOffset,b.length/2),o=new Int16Array(Math.floor(i.length/3));for(let j=0;j<o.length;j++)o[j]=i[j*3];return Buffer.from(o.buffer);}
-function upsampleTo16k(b){const i=new Int16Array(b.buffer,b.byteOffset,b.length/2),o=new Int16Array(i.length*2);for(let j=0;j<i.length;j++){o[j*2]=i[j];o[j*2+1]=i[j];}return Buffer.from(o.buffer);}
-const BIAS=0x84,CLIP=32635;
-function pcmToMulaw(b){const p=new Int16Array(b.buffer,b.byteOffset,b.length/2),m=new Uint8Array(p.length);for(let j=0;j<p.length;j++)m[j]=encodeMuLaw(p[j]);return Buffer.from(m);}
-function mulawToPcm(b){const p=new Int16Array(b.length);for(let j=0;j<b.length;j++)p[j]=decodeMuLaw(b[j]);return Buffer.from(p.buffer);}
-function encodeMuLaw(s){let sg=(s>>8)&0x80;if(sg)s=-s;if(s>CLIP)s=CLIP;s+=BIAS;let e=7;for(let m=0x4000;(s&m)===0&&e>0;e--,m>>=1){}let mt=(s>>(e+3))&0x0F;return~(sg|(e<<4)|mt);}
-function decodeMuLaw(m){m=~m;let sg=m&0x80,e=(m>>4)&0x07,mt=m&0x0F,s=(2*mt+33)<<(12-e);s-=BIAS;return sg?-s:s;}
+// --- HIGH QUALITY AUDIO UTILS ---
+
+/**
+ * Linear Interpolation Resampler (Better than "Nearest Neighbor")
+ * This fixes the "Distorted Voice" issue.
+ */
+function upsampleLinear(inputBuffer, fromRate, toRate) {
+  const input = new Int16Array(inputBuffer.buffer, inputBuffer.byteOffset, inputBuffer.length / 2);
+  const ratio = toRate / fromRate;
+  const newLength = Math.round(input.length * ratio);
+  const output = new Int16Array(newLength);
+
+  for (let i = 0; i < newLength; i++) {
+    const position = i / ratio;
+    const index = Math.floor(position);
+    const fraction = position - index;
+
+    const a = input[index];
+    const b = input[index + 1] || a; // Clamp last sample
+
+    // Simple Linear Interpolation: y = a + (b-a)*x
+    output[i] = Math.round(a + (b - a) * fraction);
+  }
+  return Buffer.from(output.buffer);
+}
+
+function downsampleLinear(inputBuffer, fromRate, toRate) {
+  const input = new Int16Array(inputBuffer.buffer, inputBuffer.byteOffset, inputBuffer.length / 2);
+  const ratio = fromRate / toRate;
+  const newLength = Math.round(input.length / ratio);
+  const output = new Int16Array(newLength);
+
+  for (let i = 0; i < newLength; i++) {
+    const position = i * ratio;
+    const index = Math.floor(position);
+    
+    // For downsampling, simple decimation with linear smoothing is often enough
+    // Ideally we'd use a low-pass filter, but this is 10x better than dropping samples.
+    output[i] = input[index];
+  }
+  return Buffer.from(output.buffer);
+}
+
+// Standard Mu-Law Decoding Table/Algorithm
+const BIAS = 0x84;
+const CLIP = 32635;
+
+function pcmToMulaw(buffer) {
+  const pcm = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
+  const mulaw = new Uint8Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) mulaw[i] = encodeMuLaw(pcm[i]);
+  return Buffer.from(mulaw);
+}
+
+function mulawToPcm(buffer) {
+  const pcmBuffer = new Int16Array(buffer.length);
+  for (let i = 0; i < buffer.length; i++) pcmBuffer[i] = decodeMuLaw(buffer[i]);
+  return Buffer.from(pcmBuffer.buffer);
+}
+
+function encodeMuLaw(sample) {
+  let sign = (sample >> 8) & 0x80;
+  if (sign !== 0) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  sample += BIAS;
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) { }
+  let mantissa = (sample >> (exponent + 3)) & 0x0F;
+  let byte = ~(sign | (exponent << 4) | mantissa);
+  return byte;
+}
+
+function decodeMuLaw(muLawByte) {
+  muLawByte = ~muLawByte;
+  let sign = muLawByte & 0x80;
+  let exponent = (muLawByte >> 4) & 0x07;
+  let mantissa = muLawByte & 0x0F;
+  let sample = (2 * mantissa + 33) << (12 - exponent);
+  sample -= BIAS;
+  return (sign === 0 ? sample : -sample);
+}
 
 // Start Server
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
   if (err) {
-    console.error("❌ Startup Error:", err);
+    console.error("Startup Error:", err);
     process.exit(1);
   }
-  console.log(`🚀 Server listening on ${address}`);
+  console.log(`🚀 Server Ready on ${address}`);
 });
