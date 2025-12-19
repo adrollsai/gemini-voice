@@ -3,12 +3,9 @@ import fastifyWs from '@fastify/websocket';
 import fastifyFormBody from '@fastify/formbody';
 import WebSocket from 'ws';
 
-// --- CONFIGURATION ---
+// Configuration
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-// REFERENCE: Using the stable 2.0 Flash Experimental model
-// This model is much more reliable for real-time audio than the "native-audio-preview"
 const MODEL = "models/gemini-2.0-flash-exp"; 
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
@@ -18,13 +15,11 @@ fastify.register(fastifyWs);
 
 fastify.get('/', async () => ({ status: "OK", system: "Gemini-Twilio Bridge" }));
 
-// 1. Twilio Webhook (HTTP)
+// 1. Twilio Webhook
 fastify.all('/twiml', async (request, reply) => {
   const host = request.headers.host;
   const wssUrl = `wss://${host}/media-stream`;
   reply.type('text/xml');
-  
-  // TwiML: Connects the call immediately to the WebSocket
   return `<?xml version="1.0" encoding="UTF-8"?>
   <Response>
       <Connect>
@@ -34,43 +29,43 @@ fastify.all('/twiml', async (request, reply) => {
   </Response>`;
 });
 
-// 2. WebSocket Handler (The Core Logic)
+// 2. WebSocket Handler
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
     console.log("📞 Twilio Stream Connected");
 
     let streamSid = null;
     let geminiWs = new WebSocket(GEMINI_URL);
-    
+
     // Connect to Gemini
     geminiWs.on('open', () => {
       console.log("✨ Connected to Gemini API");
 
-      // A. Initial Setup (Strict JSON Structure)
-      const setupMessage = {
+      // A. Initial Setup
+      const setupMsg = {
         setup: {
           model: MODEL,
-          generationConfig: {
-            responseModalities: ["AUDIO"], // We only want audio back
-            speechConfig: {
-              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } }
+          generation_config: {
+            response_modalities: ["AUDIO"],
+            speech_config: {
+              voice_config: { prebuilt_voice_config: { voice_name: "Puck" } }
             }
           }
         }
       };
-      geminiWs.send(JSON.stringify(setupMessage));
+      geminiWs.send(JSON.stringify(setupMsg));
 
-      // B. Send Initial Greeting (To wake up the AI)
-      const greetingMessage = {
-        clientContent: {
+      // B. Initial Greeting
+      const greetingMsg = {
+        client_content: {
           turns: [{
             role: "user",
             parts: [{ text: "Hello, please introduce yourself." }]
           }],
-          turnComplete: true
+          turn_complete: true
         }
       };
-      geminiWs.send(JSON.stringify(greetingMessage));
+      geminiWs.send(JSON.stringify(greetingMsg));
     });
 
     // Handle Gemini Messages (AI -> User)
@@ -79,11 +74,11 @@ fastify.register(async (fastify) => {
         const response = JSON.parse(data);
 
         // 1. Audio Output
-        if (response.serverContent && response.serverContent.modelTurn) {
-          response.serverContent.modelTurn.parts.forEach(part => {
-            if (part.inlineData && part.inlineData.mimeType.startsWith('audio/pcm')) {
-              // Gemini sends 24kHz PCM -> We convert to 8kHz Mu-Law
-              const pcm24k = Buffer.from(part.inlineData.data, 'base64');
+        if (response.server_content && response.server_content.model_turn) {
+          response.server_content.model_turn.parts.forEach(part => {
+            if (part.inline_data && part.inline_data.mime_type.startsWith('audio/pcm')) {
+              // Gemini 24k -> Twilio 8k Mu-Law
+              const pcm24k = Buffer.from(part.inline_data.data, 'base64');
               const pcm8k = downsampleTo8k(pcm24k);
               const mulaw8k = pcmToMulaw(pcm8k);
               
@@ -99,7 +94,7 @@ fastify.register(async (fastify) => {
         }
 
         // 2. Interruption Handling
-        if (response.serverContent && response.serverContent.interrupted) {
+        if (response.server_content && response.server_content.interrupted) {
           console.log("🛑 Gemini Interrupted");
           if (streamSid) {
             connection.socket.send(JSON.stringify({ event: "clear", streamSid }));
@@ -111,7 +106,6 @@ fastify.register(async (fastify) => {
     });
 
     geminiWs.on('close', () => console.log("Gemini Disconnected"));
-    geminiWs.on('error', (err) => console.error("Gemini Socket Error:", err));
 
     // Handle Twilio Messages (User -> AI)
     connection.socket.on('message', (msg) => {
@@ -123,28 +117,26 @@ fastify.register(async (fastify) => {
           console.log(`▶️ Stream Started: ${streamSid}`);
         } else if (data.event === 'media' && geminiWs.readyState === WebSocket.OPEN) {
           
-          // 1. Get raw Mu-Law chunk from Twilio
+          // 1. Decode Twilio Audio (Mu-Law -> PCM 8k)
           const mulawChunk = Buffer.from(data.media.payload, 'base64');
-          
-          // 2. Convert Mu-Law to PCM (8kHz)
           const pcm8k = mulawToPcm(mulawChunk);
 
-          // 3. Upsample to 16kHz (Required by Gemini)
-          // We use a simple doubling strategy which is robust for speech
-          const pcm16k = upsampleTo16k(pcm8k);
+          // 2. Upsample to 16k using LINEAR INTERPOLATION
+          // This is the critical fix for voice recognition quality
+          const pcm16k = upsampleLinear(pcm8k, 8000, 16000);
+          const base64Audio = pcm16k.toString('base64');
 
-          // 4. Send to Gemini
-          // IMPORTANT: Base64 encoding must be strict
-          const audioData = pcm16k.toString('base64');
-          
-          geminiWs.send(JSON.stringify({
-            realtimeInput: {
-              mediaChunks: [{
-                mimeType: "audio/pcm;rate=16000",
-                data: audioData
+          // 3. Send to Gemini
+          const audioMsg = {
+            realtime_input: {
+              media_chunks: [{
+                mime_type: "audio/pcm;rate=16000",
+                data: base64Audio
               }]
             }
-          }));
+          };
+          geminiWs.send(JSON.stringify(audioMsg));
+        
         } else if (data.event === 'stop') {
           console.log("⏹️ Call Stopped");
           geminiWs.close();
@@ -156,83 +148,34 @@ fastify.register(async (fastify) => {
   });
 });
 
-// --- AUDIO PROCESSING (G.711 Standard) ---
+// --- AUDIO UTILS (The Magic Sauce) ---
 
-// Lookup Table for Mu-Law Decoding (The Standard Way)
-// This is faster and error-proof compared to raw math formulas
-const MU_LAW_TABLE = [
-  -32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
-  -23932, -22908, -21884, -20860, -19836, -18812, -17788, -16764,
-  -15996, -15484, -14972, -14460, -13948, -13436, -12924, -12412,
-  -11900, -11388, -10876, -10364, -9852, -9340, -8828, -8316,
-  -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140,
-  -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092,
-  -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004,
-  -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980,
-  -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436,
-  -1372, -1308, -1244, -1180, -1116, -1052, -988, -924,
-  -876, -844, -812, -780, -748, -716, -684, -652,
-  -620, -588, -556, -524, -492, -460, -428, -396,
-  -372, -356, -340, -324, -308, -292, -276, -260,
-  -244, -228, -212, -196, -180, -164, -148, -132,
-  -120, -112, -104, -96, -88, -80, -72, -64,
-  -56, -48, -40, -32, -24, -16, -8, 0,
-  32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956,
-  23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764,
-  15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412,
-  11900, 11388, 10876, 10364, 9852, 9340, 8828, 8316,
-  7932, 7676, 7420, 7164, 6908, 6652, 6396, 6140,
-  5884, 5628, 5372, 5116, 4860, 4604, 4348, 4092,
-  3900, 3772, 3644, 3516, 3388, 3260, 3132, 3004,
-  2876, 2748, 2620, 2492, 2364, 2236, 2108, 1980,
-  1884, 1820, 1756, 1692, 1628, 1564, 1500, 1436,
-  1372, 1308, 1244, 1180, 1116, 1052, 988, 924,
-  876, 844, 812, 780, 748, 716, 684, 652,
-  620, 588, 556, 524, 492, 460, 428, 396,
-  372, 356, 340, 324, 308, 292, 276, 260,
-  244, 228, 212, 196, 180, 164, 148, 132,
-  120, 112, 104, 96, 88, 80, 72, 64,
-  56, 48, 40, 32, 24, 16, 8, 0
-];
+/**
+ * Linear Interpolation Resampler (8k -> 16k)
+ * Mimics high-quality resampling by averaging samples.
+ * @param {Int16Array} input - 8kHz PCM
+ * @param {number} fromRate - 8000
+ * @param {number} toRate - 16000
+ */
+function upsampleLinear(inputBuffer, fromRate, toRate) {
+  const input = new Int16Array(inputBuffer.buffer, inputBuffer.byteOffset, inputBuffer.length / 2);
+  const output = new Int16Array(input.length * 2); // strictly for 2x upsampling
 
-function mulawToPcm(buffer) {
-  const pcmBuffer = new Int16Array(buffer.length);
-  for (let i = 0; i < buffer.length; i++) {
-    // Decode using the standard lookup table
-    // (Invert the byte first as per u-law spec)
-    const byte = buffer[i] ^ 0xFF; 
-    // Map 0-255 byte to 16-bit PCM value
-    // We map the byte index to our table (approximate inverse)
-    // Note: Since we have a direct table of 256 values, we can just look it up.
-    // However, the standard table above is just values. 
-    // The robust G.711 decode logic is actually simpler:
-    pcmBuffer[i] = decodeMuLawSimple(buffer[i]);
-  }
-  return Buffer.from(pcmBuffer.buffer);
-}
-
-function decodeMuLawSimple(muLawByte) {
-  muLawByte = ~muLawByte;
-  let sign = muLawByte & 0x80;
-  let exponent = (muLawByte >> 4) & 0x07;
-  let mantissa = muLawByte & 0x0F;
-  let sample = (2 * mantissa + 33) << (12 - exponent);
-  sample -= 0x84;
-  return (sign === 0 ? sample : -sample);
-}
-
-// Simple Upsampler 8k -> 16k (Linear)
-function upsampleTo16k(buffer) {
-  const input = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
-  const output = new Int16Array(input.length * 2);
   for (let i = 0; i < input.length; i++) {
-    output[i * 2] = input[i];
-    output[i * 2 + 1] = input[i]; 
+    const current = input[i];
+    const next = (i < input.length - 1) ? input[i+1] : current;
+    
+    // Sample 1: The original point
+    output[i * 2] = current;
+    
+    // Sample 2: The interpolated point (average)
+    // This creates a smooth line between samples instead of a jagged step
+    output[i * 2 + 1] = Math.round((current + next) / 2); 
   }
   return Buffer.from(output.buffer);
 }
 
-// Simple Downsampler 24k -> 8k
+// Simple Decimation (24k -> 8k) is fine for downsampling speech
 function downsampleTo8k(buffer) {
   const input = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
   const output = new Int16Array(Math.floor(input.length / 3));
@@ -242,15 +185,25 @@ function downsampleTo8k(buffer) {
   return Buffer.from(output.buffer);
 }
 
-// PCM -> MuLaw (For Output)
+// G.711 Mu-Law Decoding Logic
+function mulawToPcm(buffer) {
+  const pcmBuffer = new Int16Array(buffer.length);
+  for (let i = 0; i < buffer.length; i++) {
+    pcmBuffer[i] = decodeMuLaw(buffer[i]);
+  }
+  return Buffer.from(pcmBuffer.buffer);
+}
+
 const BIAS = 0x84;
 const CLIP = 32635;
+
 function pcmToMulaw(buffer) {
   const pcm = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
   const mulaw = new Uint8Array(pcm.length);
   for (let i = 0; i < pcm.length; i++) mulaw[i] = encodeMuLaw(pcm[i]);
   return Buffer.from(mulaw);
 }
+
 function encodeMuLaw(sample) {
   let sign = (sample >> 8) & 0x80;
   if (sign !== 0) sample = -sample;
@@ -263,7 +216,16 @@ function encodeMuLaw(sample) {
   return byte;
 }
 
-// Start Server
+function decodeMuLaw(muLawByte) {
+  muLawByte = ~muLawByte;
+  let sign = muLawByte & 0x80;
+  let exponent = (muLawByte >> 4) & 0x07;
+  let mantissa = muLawByte & 0x0F;
+  let sample = (2 * mantissa + 33) << (12 - exponent);
+  sample -= BIAS;
+  return (sign === 0 ? sample : -sample);
+}
+
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
   if (err) { console.error(err); process.exit(1); }
   console.log(`🚀 Server listening on ${address}`);
