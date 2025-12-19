@@ -1,0 +1,17 @@
+{
+    "name": "gemini-voice-server",
+    "version": "1.0.0",
+    "scripts": {
+      "start": "node server.js"
+    },
+    "dependencies": {
+      "fastify": "^4.24.3",
+      "@fastify/websocket": "^8.2.0",
+      "@fastify/formbody": "^7.4.0",
+      "ws": "^8.14.2",
+      "dotenv": "^16.3.1"
+    },
+    "engines": {
+      "node": ">=18.0.0"
+    }
+  }
