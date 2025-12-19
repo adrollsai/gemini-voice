@@ -2,7 +2,10 @@ import Fastify from 'fastify';
 import fastifyWs from '@fastify/websocket';
 import fastifyFormBody from '@fastify/formbody';
 import WebSocket from 'ws';
-import { WaveFile } from 'wavefile'; // Professional Audio Handling
+
+// 🔴 FIX: Import 'wavefile' as a default package to fix the syntax error
+import wavefile from 'wavefile';
+const { WaveFile } = wavefile; 
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
@@ -119,10 +122,9 @@ fastify.register(async (fastify) => {
           const mulawChunk = Buffer.from(data.media.payload, 'base64');
           
           // 2. Convert to PCM 16kHz (Using WaveFile for accuracy)
-          // Matches Scala: Twilio(8k) -> Gemini(16k)
           const pcm16k = convertMulaw8kToPcm16k(mulawChunk);
 
-          // 3. Send to Gemini (No Buffering, Realtime)
+          // 3. Send to Gemini
           const audioMsg = {
             realtime_input: {
               media_chunks: [{
@@ -147,46 +149,23 @@ fastify.register(async (fastify) => {
 
 /**
  * Converts Twilio Mu-Law (8kHz) to Gemini PCM (16kHz)
- * Matches Scala `AudioConverter.twilioToGeminiStream`
  */
 function convertMulaw8kToPcm16k(mulawBuffer) {
-  // 1. Create a WaveFile instance from the Mu-Law data
   const wav = new WaveFile();
-  
-  // Twilio sends raw Mu-Law chunks without headers. 
-  // We must construct a valid container to use the library's conversion.
   wav.fromScratch(1, 8000, '8m', mulawBuffer);
-  
-  // 2. Decode Mu-Law to 16-bit PCM
   wav.fromMuLaw(); 
-  
-  // 3. Resample from 8000Hz to 16000Hz
-  // This uses proper interpolation, unlike manual math
-  wav.toSampleRate(16000); 
-
-  // 4. Extract the raw samples
-  // wavefile returns samples as Float64 or Int depending on internal state.
-  // We ensure we get a Buffer of Int16 Little Endian bytes.
-  return Buffer.from(wav.toBuffer()).subarray(44); // Remove 44-byte WAV header
+  wav.toSampleRate(16000); // Proper resampling
+  return Buffer.from(wav.toBuffer()).subarray(44);
 }
 
 /**
  * Converts Gemini PCM (24kHz) to Twilio Mu-Law (8kHz)
- * Matches Scala `AudioConverter.geminiToTwilioStream`
  */
 function convertPcm24kToMulaw8k(pcmBuffer) {
   const wav = new WaveFile();
-  
-  // Gemini sends raw 16-bit PCM at 24kHz
   wav.fromScratch(1, 24000, '16', pcmBuffer);
-  
-  // 1. Resample to 8000Hz
   wav.toSampleRate(8000);
-  
-  // 2. Encode to Mu-Law
   wav.toMuLaw();
-  
-  // 3. Return raw bytes (skip header)
   return Buffer.from(wav.toBuffer()).subarray(44);
 }
 
