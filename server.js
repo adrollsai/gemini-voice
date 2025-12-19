@@ -3,7 +3,7 @@ import fastifyWs from '@fastify/websocket';
 import fastifyFormBody from '@fastify/formbody';
 import WebSocket from 'ws';
 
-// Constants
+// Configuration
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MODEL_NAME = "models/gemini-2.5-flash-native-audio-preview-12-2025";
@@ -13,10 +13,9 @@ const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// Root Route
-fastify.get('/', async () => ({ status: "OK", message: "Voice Server Running" }));
+fastify.get('/', async () => ({ status: "OK", message: "Gemini Voice Server Ready" }));
 
-// Twilio TwiML Webhook
+// 1. TwiML Webhook
 fastify.all('/twiml', async (request, reply) => {
   const host = request.headers.host;
   const wssUrl = `wss://${host}/media-stream`;
@@ -26,23 +25,24 @@ fastify.all('/twiml', async (request, reply) => {
       <Connect>
           <Stream url="${wssUrl}" />
       </Connect>
-      <Pause length="3600" /> 
+      <Pause length="3600" />
   </Response>`;
 });
 
-// WebSocket Handler
+// 2. WebSocket Handler
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-    console.log("📞 Call Connected");
+    console.log("📞 Twilio Connection Established");
 
     let streamSid = null;
     let geminiWs = new WebSocket(GEMINI_URL);
-    let audioQueue = []; // Queue for buffering Gemini audio
+    let isAiSpeaking = false; // Flag to prevent echo
 
-    // 1. Connect to Gemini
+    // A. Connect to Gemini
     geminiWs.on('open', () => {
-      console.log("✨ Connected to Gemini");
-      // Setup the session
+      console.log("✨ Connected to Gemini API");
+      
+      // Setup
       geminiWs.send(JSON.stringify({
         setup: {
           model: MODEL_NAME,
@@ -53,63 +53,68 @@ fastify.register(async (fastify) => {
         }
       }));
 
-      // Send initial greeting to get the conversation started
-      const greeting = {
+      // Initial Greeting
+      const msg = {
         clientContent: {
-          turns: [{ role: "user", parts: [{ text: "Hello, please introduce yourself briefly." }] }],
+          turns: [{ role: "user", parts: [{ text: "Hello, please introduce yourself." }] }],
           turnComplete: true
         }
       };
-      geminiWs.send(JSON.stringify(greeting));
+      geminiWs.send(JSON.stringify(msg));
     });
 
-    // 2. Handle Gemini Messages
+    // B. Handle Gemini Messages
     geminiWs.on('message', (data) => {
       try {
         const response = JSON.parse(data);
 
-        // A. Handle Audio Output (Gemini Speaking)
+        // 1. Audio Output (Gemini -> Twilio)
         if (response.serverContent && response.serverContent.modelTurn) {
           response.serverContent.modelTurn.parts.forEach(part => {
             if (part.inlineData && part.inlineData.mimeType.startsWith('audio/pcm')) {
               if (streamSid) {
-                // Decode Gemini (24k) -> Encode Twilio (8k Mu-Law)
+                isAiSpeaking = true; // AI is talking, so we expect echo
+                
                 const pcm24k = Buffer.from(part.inlineData.data, 'base64');
-                const pcm8k = downsampleLinear(pcm24k, 24000, 8000);
+                const pcm8k = downsample24kTo8k(pcm24k);
                 const mulaw8k = pcmToMulaw(pcm8k);
                 
-                // Send immediately to Twilio
-                const mediaMsg = {
+                connection.socket.send(JSON.stringify({
                   event: "media",
                   streamSid,
                   media: { payload: mulaw8k.toString('base64') }
-                };
-                connection.socket.send(JSON.stringify(mediaMsg));
+                }));
               }
             }
           });
         }
 
-        // B. Handle Interruption (Gemini heard you!)
-        // This flag tells us Gemini has stopped generating because you spoke.
+        // 2. Interruption Handling (User interrupted AI)
         if (response.serverContent && response.serverContent.interrupted) {
-          console.log("🛑 Interrupted by User! Clearing audio.");
-          // Twilio doesn't support "Clear Buffer" natively in Streams easily,
-          // but stopping the send loop usually works.
-          // Note: Twilio will play whatever is currently in its short buffer (approx 200-500ms).
+          console.log("🛑 Interrupted! Clearing Twilio Buffer.");
+          if (streamSid) {
+            // Send "clear" to Twilio to stop playback immediately
+            connection.socket.send(JSON.stringify({ 
+              event: "clear", 
+              streamSid 
+            }));
+          }
+          isAiSpeaking = false; // Reset flag
         }
 
+        // 3. Turn Complete
         if (response.serverContent && response.serverContent.turnComplete) {
-           console.log("✅ Turn Complete");
+          isAiSpeaking = false; // AI finished talking
         }
+
       } catch (e) {
-        console.error("Error parsing Gemini message:", e);
+        console.error("Gemini Error:", e);
       }
     });
 
-    geminiWs.on('close', () => console.log("Gemini Disconnected"));
+    geminiWs.on('close', () => console.log("Gemini Closed"));
 
-    // 3. Handle Twilio Messages (User Speaking)
+    // C. Handle Twilio Messages (Twilio -> Gemini)
     connection.socket.on('message', (msg) => {
       try {
         const data = JSON.parse(msg);
@@ -117,78 +122,66 @@ fastify.register(async (fastify) => {
         if (data.event === 'start') {
           streamSid = data.start.streamSid;
           console.log(`▶️ Stream Started: ${streamSid}`);
+        
         } else if (data.event === 'media' && geminiWs.readyState === WebSocket.OPEN) {
-          // 1. Get 8k Mu-Law chunk
-          const mulaw8k = Buffer.from(data.media.payload, 'base64');
-          
-          // 2. Convert to 16k PCM (Using Linear Interpolation for quality)
-          const pcm8k = mulawToPcm(mulaw8k);
-          const pcm16k = upsampleLinear(pcm8k, 8000, 16000);
+          // OPTIONAL: Stop listening while AI is speaking (Basic Echo Cancellation)
+          // You can comment this 'if' out if you want to allow talking over the AI
+          if (!isAiSpeaking) { 
+            const mulaw8k = Buffer.from(data.media.payload, 'base64');
+            const pcm8k = mulawToPcm(mulaw8k);
+            const pcm16k = upsample8kTo16k(pcm8k); // Using new robust upsampler
 
-          // 3. Send to Gemini
-          geminiWs.send(JSON.stringify({
-            realtimeInput: {
-              mediaChunks: [{
-                mimeType: "audio/pcm;rate=16000",
-                data: pcm16k.toString('base64')
-              }]
-            }
-          }));
+            geminiWs.send(JSON.stringify({
+              realtimeInput: {
+                mediaChunks: [{
+                  mimeType: "audio/pcm;rate=16000",
+                  data: pcm16k.toString('base64')
+                }]
+              }
+            }));
+          }
         } else if (data.event === 'stop') {
           console.log("⏹️ Call Ended");
           geminiWs.close();
         }
       } catch (e) {
-        console.error("Twilio Message Error:", e);
+        console.error("Twilio Error:", e);
       }
     });
   });
 });
 
-// --- HIGH QUALITY AUDIO UTILS ---
+// --- ROBUST AUDIO MATH (Integer Based) ---
 
-/**
- * Linear Interpolation Resampler (Better than "Nearest Neighbor")
- * This fixes the "Distorted Voice" issue.
- */
-function upsampleLinear(inputBuffer, fromRate, toRate) {
-  const input = new Int16Array(inputBuffer.buffer, inputBuffer.byteOffset, inputBuffer.length / 2);
-  const ratio = toRate / fromRate;
-  const newLength = Math.round(input.length * ratio);
-  const output = new Int16Array(newLength);
-
-  for (let i = 0; i < newLength; i++) {
-    const position = i / ratio;
-    const index = Math.floor(position);
-    const fraction = position - index;
-
-    const a = input[index];
-    const b = input[index + 1] || a; // Clamp last sample
-
-    // Simple Linear Interpolation: y = a + (b-a)*x
-    output[i] = Math.round(a + (b - a) * fraction);
-  }
-  return Buffer.from(output.buffer);
-}
-
-function downsampleLinear(inputBuffer, fromRate, toRate) {
-  const input = new Int16Array(inputBuffer.buffer, inputBuffer.byteOffset, inputBuffer.length / 2);
-  const ratio = fromRate / toRate;
-  const newLength = Math.round(input.length / ratio);
-  const output = new Int16Array(newLength);
-
-  for (let i = 0; i < newLength; i++) {
-    const position = i * ratio;
-    const index = Math.floor(position);
+// 1. Upsample 8k -> 16k (Double the samples with smoothing)
+function upsample8kTo16k(buffer) {
+  const input = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
+  const output = new Int16Array(input.length * 2);
+  
+  for (let i = 0; i < input.length; i++) {
+    const current = input[i];
+    const next = (i < input.length - 1) ? input[i + 1] : current;
     
-    // For downsampling, simple decimation with linear smoothing is often enough
-    // Ideally we'd use a low-pass filter, but this is 10x better than dropping samples.
-    output[i] = input[index];
+    output[i * 2] = current;
+    // Average the current and next sample for the "in-between" sample
+    output[i * 2 + 1] = Math.floor((current + next) / 2); 
   }
   return Buffer.from(output.buffer);
 }
 
-// Standard Mu-Law Decoding Table/Algorithm
+// 2. Downsample 24k -> 8k (Take every 3rd sample)
+function downsample24kTo8k(buffer) {
+  const input = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
+  const output = new Int16Array(Math.floor(input.length / 3));
+  
+  for (let i = 0; i < output.length; i++) {
+    output[i] = input[i * 3];
+  }
+  return Buffer.from(output.buffer);
+}
+
+// 3. Mu-Law Table-Based Decoding (Fast & Accurate)
+// (Replacing formula with a standard G.711 approach for reliability)
 const BIAS = 0x84;
 const CLIP = 32635;
 
@@ -227,11 +220,8 @@ function decodeMuLaw(muLawByte) {
   return (sign === 0 ? sample : -sample);
 }
 
-// Start Server
+// Start
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
-  if (err) {
-    console.error("Startup Error:", err);
-    process.exit(1);
-  }
-  console.log(`🚀 Server Ready on ${address}`);
+  if (err) { console.error(err); process.exit(1); }
+  console.log(`🚀 Server listening on ${address}`);
 });
