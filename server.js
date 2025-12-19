@@ -3,7 +3,7 @@ import fastifyWs from '@fastify/websocket';
 import fastifyFormBody from '@fastify/formbody';
 import WebSocket from 'ws';
 
-// Configuration
+// Config
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MODEL_NAME = "models/gemini-2.5-flash-native-audio-preview-12-2025";
@@ -13,9 +13,9 @@ const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-fastify.get('/', async () => ({ status: "OK", message: "Gemini Voice Server Ready" }));
+fastify.get('/', async () => ({ status: "OK", message: "Gemini Server Online" }));
 
-// 1. TwiML Webhook
+// TwiML Hook
 fastify.all('/twiml', async (request, reply) => {
   const host = request.headers.host;
   const wssUrl = `wss://${host}/media-stream`;
@@ -29,19 +29,17 @@ fastify.all('/twiml', async (request, reply) => {
   </Response>`;
 });
 
-// 2. WebSocket Handler
+// WebSocket Handler
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-    console.log("📞 Twilio Connection Established");
-
+    console.log("📞 Client Connected");
+    
     let streamSid = null;
     let geminiWs = new WebSocket(GEMINI_URL);
-    let isAiSpeaking = false; // Flag to prevent echo
 
-    // A. Connect to Gemini
+    // 1. Connect to Gemini
     geminiWs.on('open', () => {
-      console.log("✨ Connected to Gemini API");
-      
+      console.log("✨ Gemini Connected");
       // Setup
       geminiWs.send(JSON.stringify({
         setup: {
@@ -54,29 +52,26 @@ fastify.register(async (fastify) => {
       }));
 
       // Initial Greeting
-      const msg = {
+      geminiWs.send(JSON.stringify({
         clientContent: {
           turns: [{ role: "user", parts: [{ text: "Hello, please introduce yourself." }] }],
           turnComplete: true
         }
-      };
-      geminiWs.send(JSON.stringify(msg));
+      }));
     });
 
-    // B. Handle Gemini Messages
+    // 2. Receive from Gemini
     geminiWs.on('message', (data) => {
       try {
         const response = JSON.parse(data);
 
-        // 1. Audio Output (Gemini -> Twilio)
+        // A. Audio (Speak)
         if (response.serverContent && response.serverContent.modelTurn) {
           response.serverContent.modelTurn.parts.forEach(part => {
             if (part.inlineData && part.inlineData.mimeType.startsWith('audio/pcm')) {
               if (streamSid) {
-                isAiSpeaking = true; // AI is talking, so we expect echo
-                
                 const pcm24k = Buffer.from(part.inlineData.data, 'base64');
-                const pcm8k = downsample24kTo8k(pcm24k);
+                const pcm8k = downsampleTo8k(pcm24k);
                 const mulaw8k = pcmToMulaw(pcm8k);
                 
                 connection.socket.send(JSON.stringify({
@@ -89,32 +84,21 @@ fastify.register(async (fastify) => {
           });
         }
 
-        // 2. Interruption Handling (User interrupted AI)
+        // B. Interruption (Stop Speaking)
         if (response.serverContent && response.serverContent.interrupted) {
-          console.log("🛑 Interrupted! Clearing Twilio Buffer.");
+          console.log("🛑 Interrupted!");
           if (streamSid) {
-            // Send "clear" to Twilio to stop playback immediately
-            connection.socket.send(JSON.stringify({ 
-              event: "clear", 
-              streamSid 
-            }));
+            connection.socket.send(JSON.stringify({ event: "clear", streamSid }));
           }
-          isAiSpeaking = false; // Reset flag
         }
-
-        // 3. Turn Complete
-        if (response.serverContent && response.serverContent.turnComplete) {
-          isAiSpeaking = false; // AI finished talking
-        }
-
       } catch (e) {
         console.error("Gemini Error:", e);
       }
     });
 
-    geminiWs.on('close', () => console.log("Gemini Closed"));
+    geminiWs.on('close', () => console.log("Gemini Disconnected"));
 
-    // C. Handle Twilio Messages (Twilio -> Gemini)
+    // 3. Receive from Twilio (Your Voice)
     connection.socket.on('message', (msg) => {
       try {
         const data = JSON.parse(msg);
@@ -122,26 +106,31 @@ fastify.register(async (fastify) => {
         if (data.event === 'start') {
           streamSid = data.start.streamSid;
           console.log(`▶️ Stream Started: ${streamSid}`);
-        
         } else if (data.event === 'media' && geminiWs.readyState === WebSocket.OPEN) {
-          // OPTIONAL: Stop listening while AI is speaking (Basic Echo Cancellation)
-          // You can comment this 'if' out if you want to allow talking over the AI
-          if (!isAiSpeaking) { 
-            const mulaw8k = Buffer.from(data.media.payload, 'base64');
-            const pcm8k = mulawToPcm(mulaw8k);
-            const pcm16k = upsample8kTo16k(pcm8k); // Using new robust upsampler
-
-            geminiWs.send(JSON.stringify({
-              realtimeInput: {
-                mediaChunks: [{
-                  mimeType: "audio/pcm;rate=16000",
-                  data: pcm16k.toString('base64')
-                }]
-              }
-            }));
+          
+          // NO BLOCKING LOGIC HERE!
+          // We send audio 100% of the time so Gemini hears you.
+          
+          const mulaw8k = Buffer.from(data.media.payload, 'base64');
+          const pcm8k = mulawToPcm(mulaw8k);
+          
+          // APPLY VOLUME BOOST (3x)
+          // This ensures quiet phone mics are heard clearly
+          for (let i = 0; i < pcm8k.length; i++) {
+             pcm8k[i] = pcm8k[i] * 3; 
           }
+
+          const pcm16k = upsampleTo16k(pcm8k);
+
+          geminiWs.send(JSON.stringify({
+            realtimeInput: {
+              mediaChunks: [{
+                mimeType: "audio/pcm;rate=16000",
+                data: pcm16k.toString('base64')
+              }]
+            }
+          }));
         } else if (data.event === 'stop') {
-          console.log("⏹️ Call Ended");
           geminiWs.close();
         }
       } catch (e) {
@@ -151,37 +140,27 @@ fastify.register(async (fastify) => {
   });
 });
 
-// --- ROBUST AUDIO MATH (Integer Based) ---
+// --- AUDIO MATH (Optimized) ---
 
-// 1. Upsample 8k -> 16k (Double the samples with smoothing)
-function upsample8kTo16k(buffer) {
+function upsampleTo16k(buffer) {
   const input = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
   const output = new Int16Array(input.length * 2);
-  
   for (let i = 0; i < input.length; i++) {
-    const current = input[i];
-    const next = (i < input.length - 1) ? input[i + 1] : current;
-    
-    output[i * 2] = current;
-    // Average the current and next sample for the "in-between" sample
-    output[i * 2 + 1] = Math.floor((current + next) / 2); 
+    output[i * 2] = input[i];
+    output[i * 2 + 1] = input[i]; 
   }
   return Buffer.from(output.buffer);
 }
 
-// 2. Downsample 24k -> 8k (Take every 3rd sample)
-function downsample24kTo8k(buffer) {
+function downsampleTo8k(buffer) {
   const input = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.length / 2);
   const output = new Int16Array(Math.floor(input.length / 3));
-  
   for (let i = 0; i < output.length; i++) {
     output[i] = input[i * 3];
   }
   return Buffer.from(output.buffer);
 }
 
-// 3. Mu-Law Table-Based Decoding (Fast & Accurate)
-// (Replacing formula with a standard G.711 approach for reliability)
 const BIAS = 0x84;
 const CLIP = 32635;
 
@@ -220,7 +199,6 @@ function decodeMuLaw(muLawByte) {
   return (sign === 0 ? sample : -sample);
 }
 
-// Start
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
   if (err) { console.error(err); process.exit(1); }
   console.log(`🚀 Server listening on ${address}`);
