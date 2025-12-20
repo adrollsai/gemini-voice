@@ -1,160 +1,126 @@
-import Fastify from 'fastify';
-import fastifyWs from '@fastify/websocket';
-import fastifyFormBody from '@fastify/formbody';
-import WebSocket from 'ws';
+import Fastify from "fastify";
+import fastifyWs from "@fastify/websocket";
+import fastifyFormBody from "@fastify/formbody";
+import WebSocket from "ws";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 // ---------- CONFIG ----------
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// ⚠️ REQUIRED MODEL
-const MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025";
+if (!GEMINI_API_KEY) {
+  throw new Error("❌ GEMINI_API_KEY missing");
+}
+
+const MODEL = "gemini-live-2.5-flash-native-audio";
 
 const GEMINI_URL =
-  `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
+  `wss://generativelanguage.googleapis.com/ws/gemini-live?key=${GEMINI_API_KEY}`;
 
 const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// ---------- ROUTES ----------
-fastify.get('/', async () => ({
-  status: "OK",
-  system: "Gemini 2.5 Native Audio Voice Bridge"
+// ---------- HEALTH ----------
+fastify.get("/", async () => ({
+  status: "ok",
+  service: "Gemini Live 2.5 Voice Bridge"
 }));
 
-fastify.all('/twiml', async (request, reply) => {
-  const host = request.headers.host;
-  const wssUrl = `wss://${host}/media-stream`;
+// ---------- TWIML ----------
+fastify.all("/twiml", async (req, reply) => {
+  const host = req.headers.host;
 
-  reply.type('text/xml');
-  return `<?xml version="1.0" encoding="UTF-8"?>
+  reply.type("text/xml").send(`
 <Response>
   <Connect>
-    <Stream url="${wssUrl}" />
+    <Stream url="wss://${host}/media-stream" />
   </Connect>
-  <Pause length="3600" />
-</Response>`;
+</Response>
+  `);
 });
 
 // ---------- MEDIA STREAM ----------
-fastify.register(async (fastify) => {
-  fastify.get('/media-stream', { websocket: true }, (connection) => {
-    console.log("🔵 [Twilio] Connected");
+fastify.register(async (app) => {
+  app.get("/media-stream", { websocket: true }, (conn) => {
+    fastify.log.info("🔵 Twilio connected");
 
-    let streamSid = null;
+    let streamSid;
     let geminiReady = false;
-    let packetCount = 0;
 
+    // ---------- GEMINI WS ----------
     const geminiWs = new WebSocket(GEMINI_URL);
 
-    // ---------- GEMINI ----------
-    geminiWs.on('open', () => {
-      console.log("🟢 [Gemini] Connected");
+    geminiWs.on("open", () => {
+      fastify.log.info("🟢 Gemini connected");
 
-      // ✅ NO speech_config for 2.5
       geminiWs.send(JSON.stringify({
         setup: {
-          model: MODEL
+          model: MODEL,
+          generation_config: {
+            response_modalities: ["AUDIO"]
+          }
         }
       }));
     });
 
-    geminiWs.on('message', (data) => {
-      const response = JSON.parse(data);
+    geminiWs.on("message", (msg) => {
+      const data = JSON.parse(msg);
 
-      // ---- SETUP COMPLETE ----
-      if (response.setupComplete && !geminiReady) {
+      // ---- READY ----
+      if (data.setupComplete && !geminiReady) {
         geminiReady = true;
-        console.log("✅ [Gemini] Setup Complete");
-
-        // Initial greeting
-        geminiWs.send(JSON.stringify({
-          client_content: {
-            turns: [{
-              role: "user",
-              parts: [{ text: "Hello, please introduce yourself briefly." }]
-            }],
-            turn_complete: true
-          }
-        }));
+        fastify.log.info("✅ Gemini ready");
+        return;
       }
 
       // ---- AUDIO OUTPUT ----
-      if (response.serverContent?.modelTurn?.parts && streamSid) {
-        response.serverContent.modelTurn.parts.forEach(part => {
-          if (
-            part.inlineData?.mimeType?.startsWith("audio/pcm")
-          ) {
-            // Gemini 2.5 outputs 16-bit PCM @ 24kHz
-            const pcm24kBuf = Buffer.from(part.inlineData.data, 'base64');
-            const pcm24kInt16 = new Int16Array(
-              pcm24kBuf.buffer,
-              pcm24kBuf.byteOffset,
-              pcm24kBuf.length / 2
-            );
+      const parts = data.serverContent?.modelTurn?.parts;
+      if (!parts || !streamSid) return;
 
-            const mulaw8k = convertPcm24kToMulaw8k(
-              Buffer.from(pcm24kInt16.buffer)
-            );
+      for (const part of parts) {
+        if (part.inlineData?.mimeType?.startsWith("audio/pcm")) {
+          const pcm24k = Buffer.from(part.inlineData.data, "base64");
+          const mulaw = pcm24kToMulaw8k(pcm24k);
 
-            connection.socket.send(JSON.stringify({
-              event: "media",
-              streamSid,
-              media: {
-                payload: mulaw8k.toString('base64')
-              }
-            }));
-          }
-        });
+          conn.socket.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: mulaw.toString("base64") }
+          }));
+        }
       }
     });
 
-    geminiWs.on('close', () =>
-      console.log("🔴 [Gemini] Closed")
-    );
-
-    geminiWs.on('error', (err) =>
-      console.error("Gemini Error:", err)
+    geminiWs.on("error", err =>
+      fastify.log.error("Gemini error", err)
     );
 
     // ---------- TWILIO ----------
-    connection.socket.on('message', (msg) => {
-      const data = JSON.parse(msg);
+    conn.socket.on("message", (raw) => {
+      const data = JSON.parse(raw);
 
-      if (data.event === 'start') {
+      if (data.event === "start") {
         streamSid = data.start.streamSid;
-        console.log(`▶️ Stream Started: ${streamSid}`);
+        fastify.log.info(`▶️ Stream started ${streamSid}`);
+        return;
       }
 
-      if (data.event === 'media' && geminiReady) {
-        packetCount++;
-        if (packetCount % 20 === 0) {
-          console.log(`🎤 [Twilio] ${packetCount} packets`);
-        }
-
-        const mulaw = Buffer.from(data.media.payload, 'base64');
-        const pcm16k = convertMulaw8kToPcm16k(mulaw);
+      if (data.event === "media" && geminiReady) {
+        const mulaw = Buffer.from(data.media.payload, "base64");
+        const pcm16k = mulaw8kToPcm16k(mulaw);
 
         geminiWs.send(JSON.stringify({
-          realtime_input: {
-            media_chunks: [{
-              mime_type: "audio/pcm;rate=16000",
-              data: pcm16k.toString('base64')
-            }]
+          input_audio_buffer: {
+            audio: pcm16k.toString("base64")
           }
         }));
       }
 
-      if (data.event === 'stop') {
-        console.log("⏹️ Stream stopped");
-
-        if (geminiWs.readyState === WebSocket.OPEN) {
-          geminiWs.send(JSON.stringify({
-            realtime_input: { turn_complete: true }
-          }));
-        }
-
+      if (data.event === "stop") {
+        fastify.log.info("⏹️ Stream ended");
         geminiWs.close();
       }
     });
@@ -163,12 +129,16 @@ fastify.register(async (fastify) => {
 
 // ---------- AUDIO UTILS ----------
 
-const MU_LAW_TABLE = [ /* unchanged full table */ ];
+// ⛔ KEEP YOUR FULL MU_LAW_TABLE HERE
+const MU_LAW_TABLE = [
+  /* YOUR EXISTING FULL TABLE — DO NOT CHANGE */
+];
 
-function convertMulaw8kToPcm16k(mulawBuffer) {
-  const pcm8k = new Int16Array(mulawBuffer.length);
-  for (let i = 0; i < mulawBuffer.length; i++) {
-    pcm8k[i] = MU_LAW_TABLE[mulawBuffer[i] ^ 0xff];
+function mulaw8kToPcm16k(mulaw) {
+  const pcm8k = new Int16Array(mulaw.length);
+
+  for (let i = 0; i < mulaw.length; i++) {
+    pcm8k[i] = MU_LAW_TABLE[mulaw[i] ^ 0xff];
   }
 
   const pcm16k = new Int16Array(pcm8k.length * 2);
@@ -180,11 +150,11 @@ function convertMulaw8kToPcm16k(mulawBuffer) {
   return Buffer.from(pcm16k.buffer);
 }
 
-function convertPcm24kToMulaw8k(pcmBuffer) {
+function pcm24kToMulaw8k(pcm24k) {
   const pcm = new Int16Array(
-    pcmBuffer.buffer,
-    pcmBuffer.byteOffset,
-    pcmBuffer.length / 2
+    pcm24k.buffer,
+    pcm24k.byteOffset,
+    pcm24k.length / 2
   );
 
   const mulaw = new Uint8Array(Math.floor(pcm.length / 3));
@@ -213,10 +183,10 @@ function encodeMuLaw(sample) {
 }
 
 // ---------- START ----------
-fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
+fastify.listen({ port: PORT, host: "0.0.0.0" }, (err, address) => {
   if (err) {
-    console.error(err);
+    fastify.log.error(err);
     process.exit(1);
   }
-  console.log(`🚀 Server listening on ${address}`);
+  fastify.log.info(`🚀 Listening on ${address}`);
 });
