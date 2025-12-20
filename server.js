@@ -13,7 +13,7 @@ const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-fastify.get('/', async () => ({ status: "OK", system: "Gemini 2.0 Flash Voice Bridge" }));
+fastify.get('/', async () => ({ status: "OK", system: "Gemini Calibration Mode" }));
 
 // 1. Twilio Webhook
 fastify.all('/twiml', async (request, reply) => {
@@ -37,12 +37,12 @@ fastify.register(async (fastify) => {
     let streamSid = null;
     let geminiWs = new WebSocket(GEMINI_URL);
     let isSessionActive = false;
+    let packetCount = 0;
 
     // Connect to Gemini
     geminiWs.on('open', () => {
       console.log("🟢 [Gemini] Connected");
-
-      // 1. Send Setup
+      
       const setupMsg = {
         setup: {
           model: MODEL,
@@ -82,6 +82,7 @@ fastify.register(async (fastify) => {
 
         // B. Audio Output
         if (response.serverContent?.modelTurn?.parts) {
+          console.log("🔊 [Gemini] Speaking...");
           response.serverContent.modelTurn.parts.forEach(part => {
             if (part.inlineData && part.inlineData.mimeType.startsWith('audio/pcm')) {
               const pcm24k = Buffer.from(part.inlineData.data, 'base64');
@@ -97,12 +98,12 @@ fastify.register(async (fastify) => {
             }
           });
         }
-
-        // C. Interruption
-        if (response.serverContent?.interrupted) {
-          console.log("🛑 [Gemini] Interrupted by Speech");
-          if (streamSid) connection.socket.send(JSON.stringify({ event: "clear", streamSid }));
+        
+        // Log unexpected messages to debug "Closed: 1000"
+        if (!response.serverContent && !response.setupComplete) {
+           console.log("ℹ️ [Gemini Msg]:", JSON.stringify(response));
         }
+
       } catch (e) {
         console.error("Gemini Parse Error:", e);
       }
@@ -125,25 +126,29 @@ fastify.register(async (fastify) => {
 
           // 1. Process Audio
           const mulawChunk = Buffer.from(data.media.payload, 'base64');
-          const pcm16k = convertMulaw8kToPcm16k(mulawChunk); // No more boost
+          const pcm16k = convertMulaw8kToPcm16k(mulawChunk);
 
-          // 2. NOISE GATE (The Fix)
-          // Calculate volume (RMS - Root Mean Square)
+          // 2. CALCULATE VOLUME (RMS)
           let sum = 0;
           for (let i = 0; i < pcm16k.length; i++) {
              sum += Math.abs(pcm16k[i]);
           }
           const averageVolume = sum / pcm16k.length;
 
-          // Threshold: If volume is below 500, it's likely just static/breathing
-          if (averageVolume < 500) {
-            // console.log("..silence.."); // Uncomment to see silence logs
-            return; // DROP THE PACKET
+          // 3. DEBUG LOGGING (Every ~1 sec)
+          packetCount++;
+          if (packetCount % 50 === 0) {
+            console.log(`🎤 Audio Vol: ${Math.round(averageVolume)} | Gate: 20`);
           }
 
-          console.log(`🎤 Speaking (Vol: ${Math.round(averageVolume)})`);
+          // 4. LOW THRESHOLD GATE
+          // We set this extremely low (20) to ensure we don't block your voice
+          if (averageVolume < 20) {
+            // Silence
+            return; 
+          }
 
-          // 3. Send to Gemini
+          // 5. Send to Gemini
           const audioMsg = {
             realtime_input: {
               media_chunks: [{
@@ -166,7 +171,6 @@ fastify.register(async (fastify) => {
 
 // --- AUDIO UTILS (Clean & Standard) ---
 
-// Mu-Law -> PCM 16kHz (Standard, No Boost)
 function convertMulaw8kToPcm16k(mulawBuffer) {
   const pcm8k = new Int16Array(mulawBuffer.length);
   for (let i = 0; i < mulawBuffer.length; i++) {
@@ -177,15 +181,12 @@ function convertMulaw8kToPcm16k(mulawBuffer) {
   for (let i = 0; i < pcm8k.length; i++) {
     const current = pcm8k[i];
     const next = (i < pcm8k.length - 1) ? pcm8k[i + 1] : current;
-    
-    // Standard Linear Interpolation (No Gain)
     pcm16k[i * 2] = current;
     pcm16k[i * 2 + 1] = Math.round((current + next) / 2);
   }
   return Buffer.from(pcm16k.buffer);
 }
 
-// PCM 24kHz -> Mu-Law 8kHz
 function convertPcm24kToMulaw8k(pcmBuffer) {
   const pcm24k = new Int16Array(pcmBuffer.buffer, pcmBuffer.byteOffset, pcmBuffer.length / 2);
   const mulaw = new Uint8Array(Math.floor(pcm24k.length / 3));
@@ -195,7 +196,6 @@ function convertPcm24kToMulaw8k(pcmBuffer) {
   return Buffer.from(mulaw);
 }
 
-// G.711 Tables
 const BIAS = 0x84;
 const CLIP = 32635;
 function encodeMuLaw(sample) {
