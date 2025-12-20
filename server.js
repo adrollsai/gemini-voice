@@ -13,7 +13,7 @@ const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-fastify.get('/', async () => ({ status: "OK", system: "Gemini Calibration Mode" }));
+fastify.get('/', async () => ({ status: "OK", system: "Gemini High-Gain Bridge" }));
 
 // 1. Twilio Webhook
 fastify.all('/twiml', async (request, reply) => {
@@ -67,7 +67,6 @@ fastify.register(async (fastify) => {
           console.log("✅ [Gemini] Ready");
           isSessionActive = true;
           
-          // Send Greeting
           const greetingMsg = {
             client_content: {
               turns: [{
@@ -99,9 +98,10 @@ fastify.register(async (fastify) => {
           });
         }
         
-        // Log unexpected messages to debug "Closed: 1000"
-        if (!response.serverContent && !response.setupComplete) {
-           console.log("ℹ️ [Gemini Msg]:", JSON.stringify(response));
+        // C. Interruption
+        if (response.serverContent?.interrupted) {
+          console.log("🛑 [Gemini] Interrupted");
+          if (streamSid) connection.socket.send(JSON.stringify({ event: "clear", streamSid }));
         }
 
       } catch (e) {
@@ -124,7 +124,7 @@ fastify.register(async (fastify) => {
           
           if (!isSessionActive) return;
 
-          // 1. Process Audio
+          // 1. Process Audio with 20x GAIN
           const mulawChunk = Buffer.from(data.media.payload, 'base64');
           const pcm16k = convertMulaw8kToPcm16k(mulawChunk);
 
@@ -135,20 +135,19 @@ fastify.register(async (fastify) => {
           }
           const averageVolume = sum / pcm16k.length;
 
-          // 3. DEBUG LOGGING (Every ~1 sec)
-          packetCount++;
-          if (packetCount % 50 === 0) {
-            console.log(`🎤 Audio Vol: ${Math.round(averageVolume)} | Gate: 20`);
-          }
-
-          // 4. LOW THRESHOLD GATE
-          // We set this extremely low (20) to ensure we don't block your voice
-          if (averageVolume < 20) {
-            // Silence
+          // 3. GATE (Threshold 1000)
+          // If we boosted the silence to 800, we still want to ignore it.
+          // If you speak, it should jump to > 2000.
+          if (averageVolume < 1000) {
+            // Log occasionally so we know it's working
+            packetCount++;
+            if (packetCount % 50 === 0) console.log(`🔴 Dropped Silence (Vol: ${Math.round(averageVolume)})`);
             return; 
           }
 
-          // 5. Send to Gemini
+          // 4. Send Packet
+          console.log(`🟢 Sent Speaking (Vol: ${Math.round(averageVolume)})`);
+
           const audioMsg = {
             realtime_input: {
               media_chunks: [{
@@ -169,7 +168,7 @@ fastify.register(async (fastify) => {
   });
 });
 
-// --- AUDIO UTILS (Clean & Standard) ---
+// --- AUDIO UTILS (20x Gain) ---
 
 function convertMulaw8kToPcm16k(mulawBuffer) {
   const pcm8k = new Int16Array(mulawBuffer.length);
@@ -181,8 +180,21 @@ function convertMulaw8kToPcm16k(mulawBuffer) {
   for (let i = 0; i < pcm8k.length; i++) {
     const current = pcm8k[i];
     const next = (i < pcm8k.length - 1) ? pcm8k[i + 1] : current;
-    pcm16k[i * 2] = current;
-    pcm16k[i * 2 + 1] = Math.round((current + next) / 2);
+    
+    // --- MASSIVE GAIN (20x) ---
+    // We multiply by 20 to fix the "Quiet Audio" issue
+    let sample1 = current * 20;
+    let sample2 = Math.round((current + next) / 2) * 20;
+
+    // Clamp to 16-bit Range (-32768 to 32767)
+    if (sample1 > 32767) sample1 = 32767;
+    else if (sample1 < -32768) sample1 = -32768;
+
+    if (sample2 > 32767) sample2 = 32767;
+    else if (sample2 < -32768) sample2 = -32768;
+
+    pcm16k[i * 2] = sample1;
+    pcm16k[i * 2 + 1] = sample2;
   }
   return Buffer.from(pcm16k.buffer);
 }
