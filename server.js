@@ -6,8 +6,6 @@ import WebSocket from 'ws';
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-
-// Using the 2.0 Flash Exp model (Standard for labs)
 const MODEL = "models/gemini-2.0-flash-exp"; 
 const GEMINI_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
@@ -15,17 +13,15 @@ const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-fastify.get('/', async () => "Gemini Debugger Online");
+fastify.get('/', async () => ({ status: "OK", system: "Gemini 2.0 Flash Voice Bridge" }));
 
 // 1. Twilio Webhook
 fastify.all('/twiml', async (request, reply) => {
   const host = request.headers.host;
   const wssUrl = `wss://${host}/media-stream`;
   reply.type('text/xml');
-  // We use a simple TwiML to connect immediately
   return `<?xml version="1.0" encoding="UTF-8"?>
   <Response>
-      <Say>Connecting to Gemini Debugger.</Say>
       <Connect>
           <Stream url="${wssUrl}" />
       </Connect>
@@ -36,63 +32,55 @@ fastify.all('/twiml', async (request, reply) => {
 // 2. WebSocket Handler
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-    console.log("🔵 [Twilio] New Connection");
+    console.log("📞 Twilio Connected");
 
     let streamSid = null;
     let geminiWs = new WebSocket(GEMINI_URL);
     
+    // STATE
+    let isSessionActive = false;
+    let audioQueue = [];
+
     // Connect to Gemini
     geminiWs.on('open', () => {
-      console.log("🟢 [Gemini] Connected to Google API");
+      console.log("✨ Connected to Gemini");
 
-      // 1. Send Setup
+      // Send Setup (camelCase keys)
       const setupMsg = {
         setup: {
           model: MODEL,
-          generation_config: {
-            response_modalities: ["AUDIO"],
-            speech_config: {
-              voice_config: { prebuilt_voice_config: { voice_name: "Puck" } }
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } }
             }
           }
         }
       };
-      console.log("📤 [Gemini] Sending Setup JSON");
       geminiWs.send(JSON.stringify(setupMsg));
-
-      // 2. Send Greeting (Trigger)
-      const greetingMsg = {
-        client_content: {
-          turns: [{
-            role: "user",
-            parts: [{ text: "Hello, system check." }]
-          }],
-          turn_complete: true
-        }
-      };
-      console.log("📤 [Gemini] Sending Greeting");
-      geminiWs.send(JSON.stringify(greetingMsg));
     });
 
-    // LOG EVERY MESSAGE FROM GEMINI
+    // Handle Gemini Messages
     geminiWs.on('message', (data) => {
       try {
-        const raw = data.toString();
-        const response = JSON.parse(raw);
-        
-        // Log "Setup Complete" specifically
+        const response = JSON.parse(data);
+
+        // A. Setup Complete -> Flush Queue
         if (response.setupComplete) {
-          console.log("✅ [Gemini] Setup Complete Received!");
+          console.log("✅ Gemini Ready - Flushing Queue");
+          isSessionActive = true;
+          while (audioQueue.length > 0) {
+            geminiWs.send(JSON.stringify(audioQueue.shift()));
+          }
         }
 
-        // Log Audio
+        // B. Audio Output (Gemini -> Twilio)
         if (response.serverContent?.modelTurn?.parts) {
-          console.log("🔊 [Gemini] Received Audio Chunk");
-          // Forward to Twilio
           response.serverContent.modelTurn.parts.forEach(part => {
             if (part.inlineData && part.inlineData.mimeType.startsWith('audio/pcm')) {
               const pcm24k = Buffer.from(part.inlineData.data, 'base64');
               const mulaw8k = convertPcm24kToMulaw8k(pcm24k);
+              
               if (streamSid) {
                 connection.socket.send(JSON.stringify({
                   event: "media",
@@ -103,24 +91,19 @@ fastify.register(async (fastify) => {
             }
           });
         }
-        
-        // Log Errors or other events
-        if (!response.serverContent && !response.setupComplete) {
-           console.log("❓ [Gemini] Unknown Message:", JSON.stringify(response).substring(0, 100));
-        }
 
+        // C. Interruption
+        if (response.serverContent?.interrupted) {
+          console.log("🛑 Gemini Interrupted");
+          if (streamSid) connection.socket.send(JSON.stringify({ event: "clear", streamSid }));
+        }
       } catch (e) {
-        console.error("❌ [Gemini] Parse Error:", e);
+        console.error("Gemini Parse Error:", e);
       }
     });
 
-    geminiWs.on('close', (code, reason) => {
-      console.log(`🔴 [Gemini] Closed: Code ${code} | Reason: ${reason}`);
-    });
-
-    geminiWs.on('error', (err) => {
-      console.error("🔥 [Gemini] Socket Error:", err);
-    });
+    geminiWs.on('close', (code, reason) => console.log(`Gemini Closed: ${code} ${reason}`));
+    geminiWs.on('error', (err) => console.error("Gemini Error:", err));
 
     // Handle Twilio Messages
     connection.socket.on('message', (msg) => {
@@ -129,56 +112,75 @@ fastify.register(async (fastify) => {
 
         if (data.event === 'start') {
           streamSid = data.start.streamSid;
-          console.log(`▶️ [Twilio] Stream Started: ${streamSid}`);
+          console.log(`▶️ Stream Started: ${streamSid}`);
         } else if (data.event === 'media' && geminiWs.readyState === WebSocket.OPEN) {
           
-          // Audio Pipeline
+          // 1. Process Audio (Boost + Upsample)
           const mulawChunk = Buffer.from(data.media.payload, 'base64');
-          
-          // LOGGING: Are we actually getting data?
-          // Standard Twilio chunk is 160 bytes
-          // console.log(`🎤 [Twilio] Recv ${mulawChunk.length} bytes`); 
+          const pcm16k = convertMulaw8kToPcm16k(mulawChunk); 
 
-          const pcm16k = convertMulaw8kToPcm16k(mulawChunk);
-
+          // 2. Wrap in camelCase JSON
           const audioMsg = {
-            realtime_input: {
-              media_chunks: [{
-                mime_type: "audio/pcm;rate=16000",
+            realtimeInput: {
+              mediaChunks: [{
+                mimeType: "audio/pcm;rate=16000",
                 data: pcm16k.toString('base64')
               }]
             }
           };
-          geminiWs.send(JSON.stringify(audioMsg));
+
+          // 3. Send or Queue
+          if (isSessionActive) {
+            geminiWs.send(JSON.stringify(audioMsg));
+          } else {
+            audioQueue.push(audioMsg);
+          }
         
         } else if (data.event === 'stop') {
-          console.log("⏹️ [Twilio] Stop Event");
           geminiWs.close();
         }
       } catch (e) {
-        console.error("❌ [Twilio] Error:", e);
+        console.error("Twilio Error:", e);
       }
     });
   });
 });
 
-// --- AUDIO MATH (Standard) ---
+// --- AUDIO UTILS (Math-Based) ---
+
+// Mu-Law -> PCM 16kHz + 3x Boost + Linear Interpolation
 function convertMulaw8kToPcm16k(mulawBuffer) {
   const pcm8k = new Int16Array(mulawBuffer.length);
-  for (let i = 0; i < mulawBuffer.length; i++) pcm8k[i] = decodeMuLaw(mulawBuffer[i]);
+  for (let i = 0; i < mulawBuffer.length; i++) {
+    pcm8k[i] = decodeMuLaw(mulawBuffer[i]);
+  }
+  
   const pcm16k = new Int16Array(pcm8k.length * 2);
   for (let i = 0; i < pcm8k.length; i++) {
-    pcm16k[i * 2] = pcm8k[i];
-    pcm16k[i * 2 + 1] = pcm8k[i]; // Simple doubling for safety
+    const current = pcm8k[i];
+    const next = (i < pcm8k.length - 1) ? pcm8k[i + 1] : current;
+    
+    // 300% Volume Boost
+    const sample1 = Math.max(-32768, Math.min(32767, current * 3));
+    const sample2 = Math.max(-32768, Math.min(32767, Math.round((current + next) / 2) * 3));
+
+    pcm16k[i * 2] = sample1;
+    pcm16k[i * 2 + 1] = sample2;
   }
   return Buffer.from(pcm16k.buffer);
 }
+
+// PCM 24kHz -> Mu-Law 8kHz
 function convertPcm24kToMulaw8k(pcmBuffer) {
   const pcm24k = new Int16Array(pcmBuffer.buffer, pcmBuffer.byteOffset, pcmBuffer.length / 2);
   const mulaw = new Uint8Array(Math.floor(pcm24k.length / 3));
-  for (let i = 0; i < mulaw.length; i++) mulaw[i] = encodeMuLaw(pcm24k[i * 3]);
+  for (let i = 0; i < mulaw.length; i++) {
+    mulaw[i] = encodeMuLaw(pcm24k[i * 3]);
+  }
   return Buffer.from(mulaw);
 }
+
+// G.711 Tables
 const BIAS = 0x84;
 const CLIP = 32635;
 function encodeMuLaw(sample) {
@@ -204,5 +206,5 @@ function decodeMuLaw(muLawByte) {
 
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err, address) => {
   if (err) { console.error(err); process.exit(1); }
-  console.log(`🚀 Debugger listening on ${address}`);
+  console.log(`🚀 Server listening on ${address}`);
 });
