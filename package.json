@@ -9,7 +9,6 @@
       "@fastify/websocket": "^8.2.0",
       "@fastify/formbody": "^7.4.0",
       "ws": "^8.14.2",
-      "dotenv": "^16.3.1",
-      "wavefile": "^11.0.0"
+      "dotenv": "^16.3.1"
     }
   }
