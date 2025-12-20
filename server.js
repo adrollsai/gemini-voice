@@ -36,8 +36,6 @@ fastify.register(async (fastify) => {
 
     let streamSid = null;
     let geminiWs = new WebSocket(GEMINI_URL);
-    
-    // STATE
     let isSessionActive = false;
     let audioQueue = [];
 
@@ -45,19 +43,32 @@ fastify.register(async (fastify) => {
     geminiWs.on('open', () => {
       console.log("✨ Connected to Gemini");
 
-      // Send Setup (camelCase keys)
+      // 1. SETUP (SNAKE_CASE: Validated working)
       const setupMsg = {
         setup: {
           model: MODEL,
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } }
+          generation_config: {
+            response_modalities: ["AUDIO"],
+            speech_config: {
+              voice_config: { prebuilt_voice_config: { voice_name: "Puck" } }
             }
           }
         }
       };
       geminiWs.send(JSON.stringify(setupMsg));
+
+      // 2. GREETING (SNAKE_CASE: Validated working)
+      // We send this immediately so the bot speaks first
+      const greetingMsg = {
+        client_content: {
+          turns: [{
+            role: "user",
+            parts: [{ text: "Hello, please introduce yourself." }]
+          }],
+          turn_complete: true
+        }
+      };
+      geminiWs.send(JSON.stringify(greetingMsg));
     });
 
     // Handle Gemini Messages
@@ -65,10 +76,12 @@ fastify.register(async (fastify) => {
       try {
         const response = JSON.parse(data);
 
-        // A. Setup Complete -> Flush Queue
+        // A. Setup Complete
+        // Note: Gemini sends "setupComplete" (camelCase) back
         if (response.setupComplete) {
-          console.log("✅ Gemini Ready - Flushing Queue");
+          console.log("✅ Gemini Ready");
           isSessionActive = true;
+          // Flush any audio we buffered while waiting
           while (audioQueue.length > 0) {
             geminiWs.send(JSON.stringify(audioQueue.shift()));
           }
@@ -103,7 +116,7 @@ fastify.register(async (fastify) => {
     });
 
     geminiWs.on('close', (code, reason) => console.log(`Gemini Closed: ${code} ${reason}`));
-    geminiWs.on('error', (err) => console.error("Gemini Error:", err));
+    geminiWs.on('error', (err) => console.error("Gemini Socket Error:", err));
 
     // Handle Twilio Messages
     connection.socket.on('message', (msg) => {
@@ -115,15 +128,15 @@ fastify.register(async (fastify) => {
           console.log(`▶️ Stream Started: ${streamSid}`);
         } else if (data.event === 'media' && geminiWs.readyState === WebSocket.OPEN) {
           
-          // 1. Process Audio (Boost + Upsample)
+          // 1. Process Audio
           const mulawChunk = Buffer.from(data.media.payload, 'base64');
-          const pcm16k = convertMulaw8kToPcm16k(mulawChunk); 
+          const pcm16k = convertMulaw8kToPcm16k(mulawChunk); // 3x Boost Included
 
-          // 2. Wrap in camelCase JSON
+          // 2. Wrap in SNAKE_CASE JSON (Validated working)
           const audioMsg = {
-            realtimeInput: {
-              mediaChunks: [{
-                mimeType: "audio/pcm;rate=16000",
+            realtime_input: {
+              media_chunks: [{
+                mime_type: "audio/pcm;rate=16000",
                 data: pcm16k.toString('base64')
               }]
             }
@@ -160,7 +173,7 @@ function convertMulaw8kToPcm16k(mulawBuffer) {
     const current = pcm8k[i];
     const next = (i < pcm8k.length - 1) ? pcm8k[i + 1] : current;
     
-    // 300% Volume Boost
+    // 3x Volume Boost
     const sample1 = Math.max(-32768, Math.min(32767, current * 3));
     const sample2 = Math.max(-32768, Math.min(32767, Math.round((current + next) / 2) * 3));
 
