@@ -13,7 +13,7 @@ const fastify = Fastify({ logger: true });
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-fastify.get('/', async () => ({ status: "OK", system: "Gemini 2.0 Flash Voice Bridge" }));
+fastify.get('/', async () => ({ status: "OK", system: "Gemini Debugger" }));
 
 // 1. Twilio Webhook
 fastify.all('/twiml', async (request, reply) => {
@@ -32,18 +32,18 @@ fastify.all('/twiml', async (request, reply) => {
 // 2. WebSocket Handler
 fastify.register(async (fastify) => {
   fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-    console.log("📞 Twilio Connected");
+    console.log("🔵 [Twilio] Connected");
 
     let streamSid = null;
     let geminiWs = new WebSocket(GEMINI_URL);
     let isSessionActive = false;
-    let audioQueue = [];
+    let packetCount = 0;
 
     // Connect to Gemini
     geminiWs.on('open', () => {
-      console.log("✨ Connected to Gemini");
+      console.log("🟢 [Gemini] Socket Open");
 
-      // 1. SETUP (SNAKE_CASE: Validated working)
+      // 1. Send Setup
       const setupMsg = {
         setup: {
           model: MODEL,
@@ -55,20 +55,8 @@ fastify.register(async (fastify) => {
           }
         }
       };
+      console.log("📤 [Gemini] Sending Setup...");
       geminiWs.send(JSON.stringify(setupMsg));
-
-      // 2. GREETING (SNAKE_CASE: Validated working)
-      // We send this immediately so the bot speaks first
-      const greetingMsg = {
-        client_content: {
-          turns: [{
-            role: "user",
-            parts: [{ text: "Hello, please introduce yourself." }]
-          }],
-          turn_complete: true
-        }
-      };
-      geminiWs.send(JSON.stringify(greetingMsg));
     });
 
     // Handle Gemini Messages
@@ -77,18 +65,26 @@ fastify.register(async (fastify) => {
         const response = JSON.parse(data);
 
         // A. Setup Complete
-        // Note: Gemini sends "setupComplete" (camelCase) back
         if (response.setupComplete) {
-          console.log("✅ Gemini Ready");
+          console.log("✅ [Gemini] Setup Complete! Sending Greeting...");
           isSessionActive = true;
-          // Flush any audio we buffered while waiting
-          while (audioQueue.length > 0) {
-            geminiWs.send(JSON.stringify(audioQueue.shift()));
-          }
+          
+          // Send Greeting NOW (Wait for setup first)
+          const greetingMsg = {
+            client_content: {
+              turns: [{
+                role: "user",
+                parts: [{ text: "Hello, please introduce yourself." }]
+              }],
+              turn_complete: true
+            }
+          };
+          geminiWs.send(JSON.stringify(greetingMsg));
         }
 
-        // B. Audio Output (Gemini -> Twilio)
+        // B. Audio Output
         if (response.serverContent?.modelTurn?.parts) {
+          console.log("🔊 [Gemini] Speaking..."); // Log when AI speaks
           response.serverContent.modelTurn.parts.forEach(part => {
             if (part.inlineData && part.inlineData.mimeType.startsWith('audio/pcm')) {
               const pcm24k = Buffer.from(part.inlineData.data, 'base64');
@@ -107,16 +103,16 @@ fastify.register(async (fastify) => {
 
         // C. Interruption
         if (response.serverContent?.interrupted) {
-          console.log("🛑 Gemini Interrupted");
+          console.log("🛑 [Gemini] Interrupted by User Audio");
           if (streamSid) connection.socket.send(JSON.stringify({ event: "clear", streamSid }));
         }
       } catch (e) {
-        console.error("Gemini Parse Error:", e);
+        console.error("❌ [Gemini] Parse Error:", e);
       }
     });
 
-    geminiWs.on('close', (code, reason) => console.log(`Gemini Closed: ${code} ${reason}`));
-    geminiWs.on('error', (err) => console.error("Gemini Socket Error:", err));
+    geminiWs.on('close', (code, reason) => console.log(`🔴 [Gemini] Closed: ${code} ${reason}`));
+    geminiWs.on('error', (err) => console.error("🔥 [Gemini] Error:", err));
 
     // Handle Twilio Messages
     connection.socket.on('message', (msg) => {
@@ -125,14 +121,20 @@ fastify.register(async (fastify) => {
 
         if (data.event === 'start') {
           streamSid = data.start.streamSid;
-          console.log(`▶️ Stream Started: ${streamSid}`);
+          console.log(`▶️ [Twilio] Stream Started: ${streamSid}`);
         } else if (data.event === 'media' && geminiWs.readyState === WebSocket.OPEN) {
           
+          // Debug Logging (Every 50 packets ~ 1 second)
+          packetCount++;
+          if (packetCount % 50 === 0) console.log(`🎤 [Twilio] Processed ${packetCount} audio packets`);
+
+          if (!isSessionActive) return; // Ignore audio before setup is done
+
           // 1. Process Audio
           const mulawChunk = Buffer.from(data.media.payload, 'base64');
-          const pcm16k = convertMulaw8kToPcm16k(mulawChunk); // 3x Boost Included
+          const pcm16k = convertMulaw8kToPcm16k(mulawChunk); 
 
-          // 2. Wrap in SNAKE_CASE JSON (Validated working)
+          // 2. Send to Gemini
           const audioMsg = {
             realtime_input: {
               media_chunks: [{
@@ -141,27 +143,22 @@ fastify.register(async (fastify) => {
               }]
             }
           };
-
-          // 3. Send or Queue
-          if (isSessionActive) {
-            geminiWs.send(JSON.stringify(audioMsg));
-          } else {
-            audioQueue.push(audioMsg);
-          }
+          geminiWs.send(JSON.stringify(audioMsg));
         
         } else if (data.event === 'stop') {
+          console.log("⏹️ [Twilio] Stop Event");
           geminiWs.close();
         }
       } catch (e) {
-        console.error("Twilio Error:", e);
+        console.error("❌ [Twilio] Error:", e);
       }
     });
   });
 });
 
-// --- AUDIO UTILS (Math-Based) ---
+// --- AUDIO UTILS ---
 
-// Mu-Law -> PCM 16kHz + 3x Boost + Linear Interpolation
+// Mu-Law -> PCM 16kHz + 1.5x Boost (Safer)
 function convertMulaw8kToPcm16k(mulawBuffer) {
   const pcm8k = new Int16Array(mulawBuffer.length);
   for (let i = 0; i < mulawBuffer.length; i++) {
@@ -173,9 +170,9 @@ function convertMulaw8kToPcm16k(mulawBuffer) {
     const current = pcm8k[i];
     const next = (i < pcm8k.length - 1) ? pcm8k[i + 1] : current;
     
-    // 3x Volume Boost
-    const sample1 = Math.max(-32768, Math.min(32767, current * 3));
-    const sample2 = Math.max(-32768, Math.min(32767, Math.round((current + next) / 2) * 3));
+    // 1.5x Volume Boost (Reduced from 3x to stop self-interruption)
+    const sample1 = Math.max(-32768, Math.min(32767, current * 1.5));
+    const sample2 = Math.max(-32768, Math.min(32767, Math.round((current + next) / 2) * 1.5));
 
     pcm16k[i * 2] = sample1;
     pcm16k[i * 2 + 1] = sample2;
